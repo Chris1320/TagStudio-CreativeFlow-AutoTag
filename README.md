@@ -1,5 +1,9 @@
 # TagStudio Creative Flow AutoTag
 
+<img width="1920" height="1020" alt="TagStudio library tags" src="https://github.com/user-attachments/assets/5e9e0a49-e4ce-44b3-97d3-6b95551b8d9d" />
+<img width="1920" height="1020" alt="AutoTag in action" src="https://github.com/user-attachments/assets/95ea5f68-fc5d-4bfb-8922-29552b709b13" />
+
+
 This is a Python script that uses [Google Gemini](https://aistudio.google.com/) to automatically tag assets in a
 [TagStudio](https://github.com/TagStudioDev/TagStudio) library. It analyzes media content and metadata and then
 intelligently assign tags strictly from your existing TagStudio tags.
@@ -71,7 +75,7 @@ python tscf_autotag.py /path/to/tagstudio/library
 | `--filetype-exclude`     | Exclude entries with these file suffixes.                               | None                             |
 | `--delay`                | Delay in seconds between requests to avoid rate limits.                 | `4.0`                            |
 
-_Run `uv run tscf_autotag.py --help` for the full list of available arguments._
+_Run `uv run tscf_autotag.py --help` for the full and updated list of available arguments._
 
 ## How It Works
 
