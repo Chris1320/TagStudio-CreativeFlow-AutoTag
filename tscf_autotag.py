@@ -487,7 +487,7 @@ def downscale_image(
                 )
 
             with open(output_path, "wb") as output:
-                img.save(output, format=img.format or "JPEG")
+                img.save(output, format=img.format or "PNG")
 
     return output_path
 
