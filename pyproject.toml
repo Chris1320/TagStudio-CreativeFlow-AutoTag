@@ -1,0 +1,11 @@
+[project]
+name = "tagstudio-creativeflow-autotag"
+version = "0.1.0"
+description = "Automatically tag assets in your TagStudio library using Google Gemini."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "google-genai>=1.73.1",
+    "pillow>=12.2.0",
+    "tqdm>=4.67.3",
+]
