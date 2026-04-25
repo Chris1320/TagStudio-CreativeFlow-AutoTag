@@ -59,7 +59,7 @@ pip install -r requirements.txt
 python tscf_autotag.py /path/to/tagstudio/library
 ```
 
-### Key CLI Options
+### Command-Line Options
 
 | Argument                 | Description                                                             | Default                          |
 | ------------------------ | ----------------------------------------------------------------------- | -------------------------------- |
