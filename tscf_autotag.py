@@ -185,7 +185,7 @@ Sample Output Format:
 {
   "suggested_tags": [1002, 1004],
   "confidence_score": 0.95,
-  "reasoning": "Explanation of why these tags were chosen."
+  "reasoning": "Explanation of why these tags were chosen. Explain the reasoning behind all the tags."
 }
 ```
 """
@@ -975,6 +975,7 @@ def main(
 
         entries_to_process = get_entries_to_process(library_path, tags_to_process)
         if filetype_include:
+            print(f"Filtering files to process only {', '.join(filetype_include)} files...")
             entries_to_process = [
                 eid
                 for eid in entries_to_process
@@ -983,6 +984,7 @@ def main(
 
         # Explicitly apply only if `filetype_include` is not provided to avoid conflicts. If both are provided, `filetype_include` takes precedence.
         if filetype_exclude and not filetype_include:
+            print(f"Filtering files to process all except {', '.join(filetype_exclude)} files...")
             entries_to_process = [
                 eid
                 for eid in entries_to_process
@@ -990,6 +992,7 @@ def main(
             ]
 
         if limit > 0:
+            print(f"Filtering files to process only the first {limit} entries...")
             entries_to_process = entries_to_process[:limit]
 
         print(f"Found {len(entries_to_process)} entries to process.")
