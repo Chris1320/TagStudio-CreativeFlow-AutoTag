@@ -84,3 +84,7 @@ _Run `uv run tscf_autotag.py --help` for the full and updated list of available 
 3. **Downscaling:** Temporarily downscales heavy media assets using `ffmpeg` or `Pillow` to reduce transfer times and API usage.
 4. **AI Processing:** Uploads the media and sends a prompt containing your complete flat TagStudio taxonomy mapping to Google Gemini.
 5. **Database Update:** Interprets the JSON response from Gemini, validates the confidence threshold, and applies the newly suggested tag IDs directly to the local TagStudio SQLite database.
+
+## Compatibility
+
+This script has been tested on **TagStudio Alpha v9.5.6**.
