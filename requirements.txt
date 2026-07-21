@@ -2,7 +2,7 @@
 #    uv pip compile pyproject.toml --no-deps --output-file requirements.txt
 google-genai==1.73.1
     # via tagstudio-creativeflow-autotag (pyproject.toml)
-pillow==12.2.0
+pillow==12.3.0
     # via tagstudio-creativeflow-autotag (pyproject.toml)
 tqdm==4.67.3
     # via tagstudio-creativeflow-autotag (pyproject.toml)
