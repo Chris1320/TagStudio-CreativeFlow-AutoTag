@@ -9,21 +9,21 @@ Use Google Gemini to automatically tag assets in my TagStudio "Creative Flow" li
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import mimetypes
 import os
+import queue
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-import concurrent.futures
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Final, Callable
-import queue
 
 from google import genai
 from google.genai import errors, types
@@ -282,6 +282,7 @@ def _flatten_tags(
             aliases=list(node.aliases),
             paths=[path_text],
         )
+
     elif path_text not in tag.paths:
         tag.paths.append(path_text)
 
@@ -492,6 +493,7 @@ def downscale_image(
                 if width > height:
                     new_width = max_dimension
                     new_height = int(max_dimension * (height / width))
+
                 else:
                     new_height = max_dimension
                     new_width = int(max_dimension * (width / height))
@@ -696,6 +698,7 @@ def classify_entry(
     verbose: bool,
     log_func: Callable[[str], None] = tqdm.write,
     status_updater: Callable[[str, str], None] = lambda fn, msg: None,
+    cancel_event: threading.Event | None = None,
 ) -> ClassifierResponse:
     """
     Classify an entry and suggest tags based on its information and the provided taxonomy.
@@ -865,6 +868,9 @@ Asset Properties:
         log_func("Waiting for uploaded file to be processed and become ACTIVE...")
         time_waited = 0
         while True:
+            if cancel_event and cancel_event.is_set():
+                raise InterruptedError("Cancelled by user")
+
             # check if file is ACTIVE
             if (
                 gemini_client.files.get(
@@ -929,6 +935,7 @@ def process_entry_task(
     delay: float,
     worker_queue: queue.Queue[int],
     worker_bars: list[tqdm[Any]],
+    cancel_event: threading.Event,
 ) -> tuple[int, str | None]:
     """
     Process a single entry. This function is designed to be executed in a thread.
@@ -944,6 +951,9 @@ def process_entry_task(
 
     entry_info: EntryInfo | None = None
     try:
+        if cancel_event.is_set():
+            return (entry_id, None)
+
         set_status("???", "Loading entry info...")
         entry_info = get_entry_info(library_path, entry_id)
 
@@ -967,6 +977,9 @@ def process_entry_task(
 
         while current_retry <= max_retries:
             try:
+                if cancel_event.is_set():
+                    break
+
                 response = classify_entry(
                     library_path=library_path,
                     gemini_client=client,
@@ -978,6 +991,7 @@ def process_entry_task(
                     verbose=verbose,
                     log_func=log_to_buffer,
                     status_updater=set_status,
+                    cancel_event=cancel_event,
                 )
 
                 if response.confidence_score < min_confidence_score:
@@ -1073,10 +1087,14 @@ def process_entry_task(
             log_func=log_to_buffer,
         )
 
-        if delay > 0:
+        if delay > 0 and not cancel_event.is_set():
             output_buffer.append(f"Waiting for {delay} seconds to avoid rate limits...")
             set_status(entry_info.filename, "Sleeping...")
-            time.sleep(delay)
+            # Break down sleep so it can be interrupted
+            for _ in range(int(delay * 10)):
+                if cancel_event.is_set():
+                    break
+                time.sleep(0.1)
 
         try:
             term_size = os.get_terminal_size().columns
@@ -1149,6 +1167,8 @@ def main(
     Returns:
         An integer exit code (0 for success).
     """
+
+    cancel_event = threading.Event()
 
     try:
         start_time = time.time()
@@ -1266,7 +1286,10 @@ def main(
                 )
             )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+        cancel_event = threading.Event()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=threads)
+
+        try:
             futures: list[concurrent.futures.Future[tuple[int, str | None]]] = []
             for entry_id in entries_to_process:
                 # We submit tasks to thread pool here
@@ -1293,26 +1316,37 @@ def main(
                         delay=delay,
                         worker_queue=worker_queue,
                         worker_bars=worker_bars,
+                        cancel_event=cancel_event,
                     )
                 )
 
-            for future in tqdm(
-                concurrent.futures.as_completed(futures),
-                total=len(entries_to_process),
-                desc="Tagging assets",
-                dynamic_ncols=True,
-                position=0,
-                leave=True,
-            ):
-                entry_id, filesuffix = future.result()
-                if filesuffix is None:
-                    # Failed processing
-                    failed_entries.append(entry_id)
-                else:
-                    total_filetypes_processed[filesuffix] = (
-                        total_filetypes_processed.get(filesuffix, 0) + 1
-                    )
+            try:
+                for future in tqdm(
+                    concurrent.futures.as_completed(futures),
+                    total=len(entries_to_process),
+                    desc="Tagging assets",
+                    dynamic_ncols=True,
+                    position=0,
+                    leave=True,
+                ):
+                    entry_id, filesuffix = future.result()
                     processed_count += 1
+                    if filesuffix is None:
+                        # Failed processing
+                        failed_entries.append(entry_id)
+                    else:
+                        total_filetypes_processed[filesuffix] = (
+                            total_filetypes_processed.get(filesuffix, 0) + 1
+                        )
+            except KeyboardInterrupt:
+                cancel_event.set()
+                print("\nKeyboardInterrupt received. Cancelling pending tasks...")
+                # Exit cleanly without waiting for threaded hanging processes
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+        finally:
+            if not cancel_event.is_set():
+                executor.shutdown(wait=True)
 
         if len(failed_entries) > 0:
             print()
@@ -1342,6 +1376,8 @@ def main(
 
     except KeyboardInterrupt:
         print("\nProcess interrupted by user. Exiting.")
+        if "cancel_event" in locals():
+            cancel_event.set()
         return 1
 
     finally:
@@ -1362,6 +1398,13 @@ def main(
 
         except OSError:
             pass  # It's fine if the temp directory is not empty or cannot be removed
+
+        # Fast exit to avoid hanging on thread shutdown if canceled
+        try:
+            if "cancel_event" in locals() and cancel_event.is_set():
+                os._exit(1)
+        except NameError:
+            pass
 
 
 if __name__ == "__main__":
@@ -1478,27 +1521,30 @@ if __name__ == "__main__":
         help="Print the full system prompt with taxonomy for debugging purposes (only if `--show-prompts` is True)",
     )
     args = parser.parse_args()
-    sys.exit(
-        main(
-            library_path=args.library_path,
-            tags_to_process=set(args.tags_to_process),
-            tags_to_add=set(args.tags_to_add),
-            tags_to_remove=set(args.tags_to_remove),
-            allow_category_tags=args.allow_category_tags,
-            remove_current_tags=args.remove_current_tags,
-            min_confidence_score=args.min_confidence_score,
-            limit=args.limit,
-            model=args.model,
-            api_key=args.api_key,
-            max_retries=args.max_retries,
-            retry_delay=args.retry_delay,
-            delay=args.delay,
-            max_file_read_size=args.max_file_read_size,
-            fail_on_max_retries=args.fail_on_max_retries,
-            filetype_include=set(args.filetype_include),
-            filetype_exclude=set(args.filetype_exclude),
-            show_prompts=args.show_prompts,
-            verbose=args.verbose,
-            threads=args.threads,
+    try:
+        sys.exit(
+            main(
+                library_path=args.library_path,
+                tags_to_process=set(args.tags_to_process),
+                tags_to_add=set(args.tags_to_add),
+                tags_to_remove=set(args.tags_to_remove),
+                allow_category_tags=args.allow_category_tags,
+                remove_current_tags=args.remove_current_tags,
+                min_confidence_score=args.min_confidence_score,
+                limit=args.limit,
+                model=args.model,
+                api_key=args.api_key,
+                max_retries=args.max_retries,
+                retry_delay=args.retry_delay,
+                delay=args.delay,
+                max_file_read_size=args.max_file_read_size,
+                fail_on_max_retries=args.fail_on_max_retries,
+                filetype_include=set(args.filetype_include),
+                filetype_exclude=set(args.filetype_exclude),
+                show_prompts=args.show_prompts,
+                verbose=args.verbose,
+                threads=args.threads,
+            )
         )
-    )
+    except KeyboardInterrupt:
+        os._exit(1)
