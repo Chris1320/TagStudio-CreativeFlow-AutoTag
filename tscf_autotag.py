@@ -16,11 +16,14 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import concurrent.futures
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Callable
+import queue
 
 from google import genai
 from google.genai import errors, types
@@ -383,6 +386,8 @@ def update_entry_tags(
     flat_tags_cache: dict[int, Tag],
     allow_category_tags: bool = True,
     remove_current_tags: bool = False,
+    db_lock: threading.Lock | None = None,
+    log_func: Callable[[str], None] = tqdm.write,
 ) -> None:
     """
     Update the tags of an entry by adding and removing specified tags.
@@ -395,41 +400,51 @@ def update_entry_tags(
         flat_tags_cache: A dictionary mapping tag IDs to Tag objects for quick lookup.
         allow_category_tags: Whether to allow adding category tags (tags with `is_category=True`). If False, category tags in `tags_to_add` will be ignored.
         remove_current_tags: Whether to remove all current tags from the entry before applying new tags. If True, `tags_to_remove` will be ignored and all existing tags will be removed.
+        db_lock: A `threading.Lock` object for thread-safe SQLite operations.
+        log_func: A callable function to manage log outputs (default: `tqdm.write`).
     """
 
-    conn = sqlite3.connect(Path(library_path) / TAGSTUDIO_DB_FILENAME)
-    cursor = conn.cursor()
+    if db_lock:
+        db_lock.acquire()
 
-    if remove_current_tags:
-        cursor.execute("DELETE FROM tag_entries WHERE entry_id = ?", (entry_id,))
+    try:
+        conn = sqlite3.connect(Path(library_path) / TAGSTUDIO_DB_FILENAME)
+        cursor = conn.cursor()
 
-    # Add new tags
-    for tag_id in tags_to_add:
-        tag = flat_tags_cache.get(tag_id)
-        if not tag:
-            tqdm.write(f"[WARN] Tag ID {tag_id} not found in taxonomy. Skipping...")
-            continue
+        if remove_current_tags:
+            cursor.execute("DELETE FROM tag_entries WHERE entry_id = ?", (entry_id,))
 
-        if not allow_category_tags and tag.is_category:
-            tqdm.write(
-                f"[WARN] Tag '{tag.name}' (ID {tag_id}) is a category tag and will not be added because `allow_category_tags` is False."
+        # Add new tags
+        for tag_id in tags_to_add:
+            tag = flat_tags_cache.get(tag_id)
+            if not tag:
+                log_func(f"[WARN] Tag ID {tag_id} not found in taxonomy. Skipping...")
+                continue
+
+            if not allow_category_tags and tag.is_category:
+                log_func(
+                    f"[WARN] Tag '{tag.name}' (ID {tag_id}) is a category tag and will not be added because `allow_category_tags` is False."
+                )
+                continue
+
+            cursor.execute(
+                "INSERT OR IGNORE INTO tag_entries (entry_id, tag_id) VALUES (?, ?)",
+                (entry_id, tag_id),
             )
-            continue
 
-        cursor.execute(
-            "INSERT OR IGNORE INTO tag_entries (entry_id, tag_id) VALUES (?, ?)",
-            (entry_id, tag_id),
-        )
+        # Remove specified tags
+        for tag_id in tags_to_remove:
+            cursor.execute(
+                "DELETE FROM tag_entries WHERE entry_id = ? AND tag_id = ?",
+                (entry_id, tag_id),
+            )
 
-    # Remove specified tags
-    for tag_id in tags_to_remove:
-        cursor.execute(
-            "DELETE FROM tag_entries WHERE entry_id = ? AND tag_id = ?",
-            (entry_id, tag_id),
-        )
+        conn.commit()
+        conn.close()
 
-    conn.commit()
-    conn.close()
+    finally:
+        if db_lock:
+            db_lock.release()
 
 
 def get_sibling_context(
@@ -452,7 +467,9 @@ def get_sibling_context(
 
 
 def downscale_image(
-    image_path: Path, max_dimension: int = DOWNSCALE_IMAGE_MAX_DIMENSION
+    image_path: Path,
+    max_dimension: int = DOWNSCALE_IMAGE_MAX_DIMENSION,
+    log_func: Callable[[str], None] = tqdm.write,
 ) -> Path:
     """
     Downscale an image to the specified maximum dimension while maintaining aspect ratio.
@@ -460,6 +477,7 @@ def downscale_image(
     Args:
         image_path: The path to the image file.
         max_dimension: The maximum width or height of the downscaled image.
+        log_func: A callable function to manage log outputs (default: `tqdm.write`)
 
     Returns:
         The filepath of the downscaled image.
@@ -478,7 +496,7 @@ def downscale_image(
                     new_height = max_dimension
                     new_width = int(max_dimension * (width / height))
 
-                tqdm.write(
+                log_func(
                     f"Downscaling image to {new_width}x{new_height} ({output_path})"
                 )
                 # Image.ANTIALIAS was removed in Pillow 10+, so we use Image.Resampling.LANCZOS
@@ -493,7 +511,9 @@ def downscale_image(
 
 
 def downscale_video(
-    video_path: Path, max_height: int = DOWNSCALE_VIDEO_MAX_HEIGHT
+    video_path: Path,
+    max_height: int = DOWNSCALE_VIDEO_MAX_HEIGHT,
+    log_func: Callable[[str], None] = tqdm.write,
 ) -> Path:
     """
     Downscale a video to the specified maximum height while maintaining aspect ratio.
@@ -501,6 +521,7 @@ def downscale_video(
     Args:
         video_path: The path to the video file.
         max_height: The maximum height of the downscaled video.
+        log_func: A callable function to manage log outputs (default: `tqdm.write`)
 
     Returns:
         The filepath of the downscaled video.
@@ -520,7 +541,7 @@ def downscale_video(
             "copy",  # copy audio without re-encoding
             str(output_path),
         ]
-        tqdm.write(f"Downscaling video to max height {max_height} ({output_path})")
+        log_func(f"Downscaling video to max height {max_height} ({output_path})")
         subprocess.run(
             command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
         )
@@ -529,7 +550,9 @@ def downscale_video(
 
 
 def downscale_audio(
-    audio_path: Path, max_bitrate: int = DOWNSCALE_AUDIO_MAX_BITRATE
+    audio_path: Path,
+    max_bitrate: int = DOWNSCALE_AUDIO_MAX_BITRATE,
+    log_func: Callable[[str], None] = tqdm.write,
 ) -> Path:
     """
     Downscale an audio file to the specified maximum bitrate while maintaining quality.
@@ -537,6 +560,7 @@ def downscale_audio(
     Args:
         audio_path: The path to the audio file.
         max_bitrate: The maximum bitrate of the downscaled audio in kbps.
+        log_func: A callable function to manage log outputs (default: `tqdm.write`)
 
     Returns:
         The filepath of the downscaled audio.
@@ -553,9 +577,7 @@ def downscale_audio(
             f"{max_bitrate}k",
             str(output_path),
         ]
-        tqdm.write(
-            f"Downscaling audio to max bitrate {max_bitrate} kbps ({output_path})"
-        )
+        log_func(f"Downscaling audio to max bitrate {max_bitrate} kbps ({output_path})")
         subprocess.run(
             command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
         )
@@ -672,6 +694,8 @@ def classify_entry(
     remove_current_tags: bool,
     show_prompts: bool,
     verbose: bool,
+    log_func: Callable[[str], None] = tqdm.write,
+    status_updater: Callable[[str, str], None] = lambda fn, msg: None,
 ) -> ClassifierResponse:
     """
     Classify an entry and suggest tags based on its information and the provided taxonomy.
@@ -685,6 +709,8 @@ def classify_entry(
         remove_current_tags: Whether to remove all current tags from the entry before applying new tags.
         show_prompts: Whether to print the prompts used for classification to stdout for debugging purposes.
         verbose: Whether to print the full system prompt with taxonomy for debugging purposes (only if `show_prompts` is True).
+        log_func: A callable function to manage log outputs (default: `tqdm.write`).
+        status_updater: A callable function to update the status of the classification process.
 
     Returns:
         A ClassifierResponse object containing the suggested tags and reasoning.
@@ -734,7 +760,8 @@ Asset Properties:
         )
     ]
 
-    tqdm.write(f"Determined MIME type:  {mime_type} (is_text={is_text})")
+    status_updater(entry_info.filename, "Preparing metadata...")
+    log_func(f"Determined MIME type:  {mime_type} (is_text={is_text})")
     entry_file: types.File | None = None
     downscaled_entry_info_filepath: Path | None = None
     if is_text:
@@ -750,30 +777,39 @@ Asset Properties:
                 contents.append(f"File Contents:\n{text_content}")
 
         except OSError as e:
-            tqdm.write(f"[WARN] Failed to read text file. ({e})")
+            log_func(f"[WARN] Failed to read text file. ({e})")
 
     elif mime_type:
         try:
+            status_updater(
+                entry_info.filename, f"Preparing upload for analyzing ({mime_type})..."
+            )
             # Downscale images and videos before uploading to save tokens and improve
             # classification accuracy, while keeping the original file extension for
             # Gemini to recognize the file type.
             if mime_type.startswith("image/"):
                 # Downscale image
-                downscaled_entry_info_filepath = downscale_image(entry_info.filepath)
+                downscaled_entry_info_filepath = downscale_image(
+                    entry_info.filepath, log_func=log_func
+                )
                 img_props = get_image_properties(entry_info.filepath)
                 if img_props:
                     contents.append(json.dumps(img_props, default=str, indent=2))
 
             elif mime_type.startswith("video/"):
                 # Downscale video
-                downscaled_entry_info_filepath = downscale_video(entry_info.filepath)
+                downscaled_entry_info_filepath = downscale_video(
+                    entry_info.filepath, log_func=log_func
+                )
                 vid_props = get_video_properties(entry_info.filepath)
                 if vid_props:
                     contents.append(json.dumps(vid_props, default=str, indent=2))
 
             elif mime_type.startswith("audio/"):
                 # Downscale audio
-                downscaled_entry_info_filepath = downscale_audio(entry_info.filepath)
+                downscaled_entry_info_filepath = downscale_audio(
+                    entry_info.filepath, log_func=log_func
+                )
                 aud_props = get_audio_properties(entry_info.filepath)
                 if aud_props:
                     contents.append(json.dumps(aud_props, default=str, indent=2))
@@ -788,7 +824,7 @@ Asset Properties:
             contents.append(
                 f"Failed to upload file for analysis. MIME type: {mime_type}. Error: {e.message}"
             )
-            tqdm.write(
+            log_func(
                 f"[WARN] Upload rejected by Gemini. Classifying from metadata only. ({e.message})"
             )
 
@@ -796,7 +832,7 @@ Asset Properties:
         contents.append(
             "Unknown binary file. Unable to analyze content. Classifying from metadata only."
         )
-        tqdm.write("[WARN] Unknown binary file. Classifying from metadata only.")
+        log_func("[WARN] Unknown binary file. Classifying from metadata only.")
 
     system_prompt = AI_SYSTEM_PROMPT.replace(
         r"{TAXONOMY_JSON}",
@@ -804,14 +840,14 @@ Asset Properties:
     )
 
     if show_prompts:
-        tqdm.write("System Prompt:")
-        tqdm.write(
+        log_func("System Prompt:")
+        log_func(
             system_prompt
             if verbose
             else AI_SYSTEM_PROMPT.replace(r"{TAXONOMY_JSON}", "[Taxonomy JSON Omitted]")
         )
 
-        tqdm.write("Contents:")
+        log_func("Contents:")
         # Convert non-serializable objects to text descriptions
         text_contents: list[Any] = []
         for item in contents:
@@ -822,10 +858,11 @@ Asset Properties:
                 # Convert binary objects to descriptive text
                 text_contents.append(f"[{type(item).__name__} object]")
 
-        tqdm.write(json.dumps(text_contents, indent=4))
+        log_func(json.dumps(text_contents, indent=4))
 
     if entry_file:
-        tqdm.write("Waiting for uploaded file to be processed and become ACTIVE...")
+        status_updater(entry_info.filename, "Waiting for upload to be active...")
+        log_func("Waiting for uploaded file to be processed and become ACTIVE...")
         time_waited = 0
         while True:
             # check if file is ACTIVE
@@ -835,17 +872,18 @@ Asset Properties:
                 ).state
                 == "ACTIVE"
             ):
-                tqdm.write("File is ACTIVE. Proceeding with classification.")
+                log_func("File is ACTIVE. Proceeding with classification.")
                 break
 
             time.sleep(FILE_UPLOAD_POLL_INTERVAL)
             time_waited += FILE_UPLOAD_POLL_INTERVAL
             if time_waited >= FILE_UPLOAD_MAX_TIMEOUT:
-                tqdm.write(
+                log_func(
                     f"[WARN] Waited {time_waited} seconds for file to become ACTIVE. Proceeding with classification anyway."
                 )
                 break
 
+    status_updater(entry_info.filename, "Executing classification model...")
     response = gemini_client.models.generate_content(  # pyright: ignore[reportUnknownMemberType]
         model=model,
         config=types.GenerateContentConfig(
@@ -865,9 +903,200 @@ Asset Properties:
             downscaled_entry_info_filepath.unlink()
 
         except OSError as e:
-            tqdm.write(f"[WARN] Failed to delete temporary downscaled file. ({e})")
+            log_func(f"[WARN] Failed to delete temporary downscaled file. ({e})")
 
     return parse_classifier_response(response.text)
+
+
+def process_entry_task(
+    entry_id: int,
+    library_path: str,
+    client: genai.Client,
+    model: str,
+    max_file_read_size: int,
+    remove_current_tags: bool,
+    show_prompts: bool,
+    verbose: bool,
+    min_confidence_score: float,
+    max_retries: int,
+    fail_on_max_retries: bool,
+    retry_delay: int,
+    available_tags: dict[int, Tag],
+    tags_to_add: set[int],
+    tags_to_remove: set[int],
+    allow_category_tags: bool,
+    db_lock: threading.Lock,
+    delay: float,
+    worker_queue: queue.Queue[int],
+    worker_bars: list[tqdm[Any]],
+) -> tuple[int, str | None]:
+    """
+    Process a single entry. This function is designed to be executed in a thread.
+    Returns a tuple of (entry_id, filesuffix) on success, or (entry_id, None) on failure.
+    """
+
+    slot_id = worker_queue.get()
+
+    def set_status(filename: str, action: str):
+        worker_bars[slot_id].set_description_str(
+            f"Worker {slot_id + 1} | Asset '{filename}' ({entry_id}) | {action}"
+        )
+
+    entry_info: EntryInfo | None = None
+    try:
+        set_status("???", "Loading entry info...")
+        entry_info = get_entry_info(library_path, entry_id)
+
+        output_buffer: list[str] = []
+
+        # We need a separate output function instead of printing everything since multiple
+        # threads print at once. But tqdm handles concurrent writes well enough for our use-case
+        output_buffer.append(f"Processing entry ID:   {entry_id}")
+        output_buffer.append(f"Filepath:              {entry_info.filepath}")
+        output_buffer.append(f"Filename:              {entry_info.filename}")
+        output_buffer.append(f"File Suffix:           {entry_info.filesuffix}")
+        output_buffer.append(
+            f"Current Tags:          {', '.join([f'{t.name}' for t in entry_info.tags])}"
+        )
+
+        current_retry = 0
+        response: ClassifierResponse | None = None
+
+        def log_to_buffer(msg: str) -> None:
+            output_buffer.append(msg)
+
+        while current_retry <= max_retries:
+            try:
+                response = classify_entry(
+                    library_path=library_path,
+                    gemini_client=client,
+                    model=model,
+                    max_file_read_size=max_file_read_size,
+                    entry_info=entry_info,
+                    remove_current_tags=remove_current_tags,
+                    show_prompts=show_prompts,
+                    verbose=verbose,
+                    log_func=log_to_buffer,
+                    status_updater=set_status,
+                )
+
+                if response.confidence_score < min_confidence_score:
+                    output_buffer.append(
+                        f"[INFO] Confidence score {response.confidence_score} is below the minimum threshold of {min_confidence_score}. Retrying... (Attempt {current_retry + 1}/{max_retries})"
+                    )
+                    raise ValueError(
+                        f"Low confidence score: {response.confidence_score}"
+                    )
+
+                break  # Break out of the retry loop if successful
+
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                output_buffer.append(f"[ERROR] Classification failed: {e}")
+                current_retry += 1
+
+                if current_retry > max_retries:
+                    if fail_on_max_retries:
+                        raise e
+
+                    output_buffer.append(
+                        f"[ERROR] Max retries exceeded for entry ID {entry_id}. Skipping..."
+                    )
+                    tqdm.write("\n".join(output_buffer))
+                    return entry_id, None  # Failure
+
+                else:
+                    output_buffer.append(
+                        f"[INFO] Retrying in {retry_delay} seconds... (Attempt {current_retry}/{max_retries})"
+                    )
+                    time.sleep(retry_delay)
+
+        if response is None:
+            return entry_id, None
+
+        # Map suggested tag IDs to names for display
+        suggested_tag_names: list[str] = []
+        for tag_id in response.suggested_tags:
+            tag = available_tags.get(tag_id)
+            if tag:
+                suggested_tag_names.append(tag.name)
+            else:
+                output_buffer.append(
+                    f"[WARN] Suggested tag ID {tag_id} not found in taxonomy."
+                )
+
+        new_tags_to_add = set(response.suggested_tags) | tags_to_add
+
+        new_tags_to_add_names: list[str] = []
+        for tag_id in new_tags_to_add:
+            tag = available_tags.get(tag_id)
+            if tag:
+                new_tags_to_add_names.append(tag.name)
+            else:
+                output_buffer.append(
+                    f"[WARN] Tag to add ID {tag_id} not found in taxonomy."
+                )
+
+        tags_to_remove_names: list[str] = []
+        for tag_id in tags_to_remove:
+            tag = available_tags.get(tag_id)
+            if tag:
+                tags_to_remove_names.append(tag.name)
+            else:
+                output_buffer.append(
+                    f"[WARN] Tag to remove ID {tag_id} not found in taxonomy."
+                )
+
+        output_buffer.append("")
+        output_buffer.append(
+            f"Suggested Tags:        {', '.join([f'{name}' for name in suggested_tag_names])}"
+        )
+        output_buffer.append(f"Confidence Score:      {response.confidence_score}")
+        output_buffer.append(f"Reasoning:             {response.reasoning}")
+        output_buffer.append("")
+        output_buffer.append(
+            f"Tags to Add:           {', '.join([f'{name}' for name in new_tags_to_add_names])}"
+        )
+        output_buffer.append(
+            f"Tags to Remove:        {', '.join([f'{name}' for name in tags_to_remove_names])}"
+        )
+        output_buffer.append("")
+
+        update_entry_tags(
+            library_path=library_path,
+            entry_id=entry_id,
+            tags_to_add=new_tags_to_add,
+            tags_to_remove=tags_to_remove,
+            flat_tags_cache=available_tags,
+            allow_category_tags=allow_category_tags,
+            remove_current_tags=remove_current_tags,
+            db_lock=db_lock,
+            log_func=log_to_buffer,
+        )
+
+        if delay > 0:
+            output_buffer.append(f"Waiting for {delay} seconds to avoid rate limits...")
+            set_status(entry_info.filename, "Sleeping...")
+            time.sleep(delay)
+
+        try:
+            term_size = os.get_terminal_size().columns
+
+        except OSError:
+            term_size = 80
+
+        output_buffer.append("=" * term_size)
+
+        tqdm.write("\n".join(output_buffer))
+
+        return entry_id, entry_info.filesuffix
+
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        tqdm.write(f"[ERROR] Unexpected error processing entry {entry_id}: {e}")
+        return entry_id, None
+
+    finally:
+        set_status(entry_info.filename if entry_info else "???", "Idle")
+        worker_queue.put(slot_id)
 
 
 def main(
@@ -890,6 +1119,7 @@ def main(
     filetype_exclude: set[str],
     show_prompts: bool,
     verbose: bool,
+    threads: int,
 ) -> int:
     """
     Main function for the TagStudio AI Tagger.
@@ -914,6 +1144,7 @@ def main(
         filetype_exclude: A set of file suffixes to exclude (e.g., 'mp4', 'jpg'). Entries with these suffixes will be skipped.
         show_prompts: Whether to print the prompts used for classification to stdout for debugging purposes.
         verbose: Whether to print the full system prompt with taxonomy for debugging purposes (only if `show_prompts` is True).
+        threads: The number of concurrent threads to use for processing entries.
 
     Returns:
         An integer exit code (0 for success).
@@ -975,7 +1206,9 @@ def main(
 
         entries_to_process = get_entries_to_process(library_path, tags_to_process)
         if filetype_include:
-            print(f"Filtering files to process only {', '.join(filetype_include)} files...")
+            print(
+                f"Filtering files to process only {', '.join(filetype_include)} files..."
+            )
             entries_to_process = [
                 eid
                 for eid in entries_to_process
@@ -984,7 +1217,9 @@ def main(
 
         # Explicitly apply only if `filetype_include` is not provided to avoid conflicts. If both are provided, `filetype_include` takes precedence.
         if filetype_exclude and not filetype_include:
-            print(f"Filtering files to process all except {', '.join(filetype_exclude)} files...")
+            print(
+                f"Filtering files to process all except {', '.join(filetype_exclude)} files..."
+            )
             entries_to_process = [
                 eid
                 for eid in entries_to_process
@@ -1006,142 +1241,78 @@ def main(
             print(f"  - {tag.name} (Total descendants: {tag.total_descendants})")
 
         print()
-        print("=" * os.get_terminal_size().columns)
+        try:
+            term_size = os.get_terminal_size().columns
+
+        except OSError:
+            term_size = 80
+
+        print("=" * term_size)
 
         processed_count = 0
-        for entry_id in tqdm(
-            entries_to_process, desc="Tagging assets", dynamic_ncols=True
-        ):
-            tqdm.write(
-                f"Processing entry ID:   {entry_id} ({processed_count + 1}/{len(entries_to_process)})"
-            )
-            entry_info = get_entry_info(library_path, entry_id)
-            tqdm.write(f"Filepath:              {entry_info.filepath}")
-            tqdm.write(f"Filename:              {entry_info.filename}")
-            tqdm.write(f"File Suffix:           {entry_info.filesuffix}")
-            tqdm.write(
-                f"Current Tags:          {', '.join([f"'{t.name}'" for t in entry_info.tags])}"
+        db_lock = threading.Lock()
+
+        worker_queue: queue.Queue[int] = queue.Queue(maxsize=threads)
+        worker_bars: list[tqdm[Any]] = []
+        for i in range(threads):
+            worker_queue.put(i)
+            # Create a simple status bar for each thread slot
+            worker_bars.append(
+                tqdm(
+                    position=i + 1,
+                    desc=f"Worker {i+1} | Idle",
+                    bar_format="{desc}",
+                    leave=False,
+                )
             )
 
-            current_retry = 0
-            response: ClassifierResponse | None = None
-            while current_retry <= max_retries:
-                try:
-                    response = classify_entry(
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+            futures: list[concurrent.futures.Future[tuple[int, str | None]]] = []
+            for entry_id in entries_to_process:
+                # We submit tasks to thread pool here
+                futures.append(
+                    executor.submit(
+                        process_entry_task,
+                        entry_id=entry_id,
                         library_path=library_path,
-                        gemini_client=client,
+                        client=client,
                         model=model,
                         max_file_read_size=max_file_read_size,
-                        entry_info=entry_info,
                         remove_current_tags=remove_current_tags,
                         show_prompts=show_prompts,
                         verbose=verbose,
+                        min_confidence_score=min_confidence_score,
+                        max_retries=max_retries,
+                        fail_on_max_retries=fail_on_max_retries,
+                        retry_delay=retry_delay,
+                        available_tags=available_tags,
+                        tags_to_add=tags_to_add,
+                        tags_to_remove=tags_to_remove,
+                        allow_category_tags=allow_category_tags,
+                        db_lock=db_lock,
+                        delay=delay,
+                        worker_queue=worker_queue,
+                        worker_bars=worker_bars,
                     )
+                )
 
-                    if response.confidence_score < min_confidence_score:
-                        tqdm.write(
-                            f"[INFO] Confidence score {response.confidence_score} is below the minimum threshold of {min_confidence_score}. Retrying... (Attempt {current_retry + 1}/{max_retries})"
-                        )
-                        raise ValueError(
-                            f"Low confidence score: {response.confidence_score}"
-                        )
-
-                    break  # Break out of the retry loop if successful
-
-                except Exception as e:  # pylint: disable=broad-exception-caught
-                    tqdm.write(f"[ERROR] Classification failed: {e}")
-                    current_retry += 1
-
-                    if current_retry > max_retries:
-                        if fail_on_max_retries:
-                            raise e
-
-                        tqdm.write(
-                            f"[ERROR] Max retries exceeded for entry ID {entry_id}. Skipping..."
-                        )
-                        failed_entries.append(entry_id)
-                        continue  # Move on to the next entry
-
-                    else:
-                        tqdm.write(
-                            f"[INFO] Retrying in {retry_delay} seconds... (Attempt {current_retry}/{max_retries})"
-                        )
-                        time.sleep(retry_delay)
-
-            if response is None:
-                # This should not happen, but just in case...
-                # I know this script is starting to look like mom's spaghetti,
-                # but hey, it's working!
-                continue
-
-            # Map suggested tag IDs to names for display
-            suggested_tag_names: list[str] = []
-            for tag_id in response.suggested_tags:
-                tag = available_tags.get(tag_id)
-                if tag:
-                    suggested_tag_names.append(tag.name)
-
+            for future in tqdm(
+                concurrent.futures.as_completed(futures),
+                total=len(entries_to_process),
+                desc="Tagging assets",
+                dynamic_ncols=True,
+                position=0,
+                leave=True,
+            ):
+                entry_id, filesuffix = future.result()
+                if filesuffix is None:
+                    # Failed processing
+                    failed_entries.append(entry_id)
                 else:
-                    tqdm.write(
-                        f"[WARN] Suggested tag ID {tag_id} not found in taxonomy."
+                    total_filetypes_processed[filesuffix] = (
+                        total_filetypes_processed.get(filesuffix, 0) + 1
                     )
-
-            new_tags_to_add = set(response.suggested_tags) | tags_to_add
-
-            new_tags_to_add_names: list[str] = []
-            for tag_id in new_tags_to_add:
-                tag = available_tags.get(tag_id)
-                if tag:
-                    new_tags_to_add_names.append(tag.name)
-
-                else:
-                    tqdm.write(f"[WARN] Tag to add ID {tag_id} not found in taxonomy.")
-
-            tags_to_remove_names: list[str] = []
-            for tag_id in tags_to_remove:
-                tag = available_tags.get(tag_id)
-                if tag:
-                    tags_to_remove_names.append(tag.name)
-
-                else:
-                    tqdm.write(
-                        f"[WARN] Tag to remove ID {tag_id} not found in taxonomy."
-                    )
-
-            tqdm.write("")
-            tqdm.write(
-                f"Suggested Tags:        {', '.join([f"'{name}'" for name in suggested_tag_names])}"
-            )
-            tqdm.write(f"Confidence Score:      {response.confidence_score}")
-            tqdm.write(f"Reasoning:             {response.reasoning}")
-            tqdm.write("")
-            tqdm.write(
-                f"Tags to Add:           {', '.join([f"'{name}'" for name in new_tags_to_add_names])}"
-            )
-            tqdm.write(
-                f"Tags to Remove:        {', '.join([f"'{name}'" for name in tags_to_remove_names])}"
-            )
-            tqdm.write("")
-
-            update_entry_tags(
-                library_path=library_path,
-                entry_id=entry_id,
-                tags_to_add=new_tags_to_add,
-                tags_to_remove=tags_to_remove,
-                flat_tags_cache=available_tags,
-                allow_category_tags=allow_category_tags,
-                remove_current_tags=remove_current_tags,
-            )
-
-            if delay > 0:
-                tqdm.write(f"Waiting for {delay} seconds to avoid rate limits...")
-                time.sleep(delay)
-
-            tqdm.write("=" * os.get_terminal_size().columns)
-            total_filetypes_processed[entry_info.filesuffix] = (
-                total_filetypes_processed.get(entry_info.filesuffix, 0) + 1
-            )
-            processed_count += 1
+                    processed_count += 1
 
         if len(failed_entries) > 0:
             print()
@@ -1291,6 +1462,12 @@ if __name__ == "__main__":
         help="Exclude entries with the following file suffixes (e.g., 'mp4', 'jpg')",
     )
     parser.add_argument(
+        "--threads",
+        type=int,
+        default=4,
+        help="Number of threads to use for processing entries concurrently (default: %(default)s)",
+    )
+    parser.add_argument(
         "--show-prompts",
         action="store_true",
         help="Print the prompts used for classification to stdout for debugging purposes",
@@ -1322,5 +1499,6 @@ if __name__ == "__main__":
             filetype_exclude=set(args.filetype_exclude),
             show_prompts=args.show_prompts,
             verbose=args.verbose,
+            threads=args.threads,
         )
     )
